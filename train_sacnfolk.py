@@ -45,6 +45,7 @@ class EvalStats:
     precision: float
     recall: float
     f1: float
+    avg_peak_count: float
     macro_precision: float
     macro_recall: float
     macro_f1: float
@@ -648,6 +649,7 @@ def evaluate(
     track_precisions: List[float] = []
     track_recalls: List[float] = []
     track_f1s: List[float] = []
+    peak_counts: List[int] = []
     total_matched = 0
     total_pred = 0
     total_true = 0
@@ -660,6 +662,7 @@ def evaluate(
         total_loss += float(loss.item())
 
         pred_times = logits_to_pred_times(logits, model.fold_size, args)
+        peak_counts.append(len(pred_times))
         precision, recall, f1, matched, n_pred, n_true = match_predictions(
             pred_times=pred_times,
             true_times=batch["true_times"],
@@ -675,6 +678,7 @@ def evaluate(
     macro_precision = float(np.mean(track_precisions)) if track_precisions else 0.0
     macro_recall = float(np.mean(track_recalls)) if track_recalls else 0.0
     macro_f1 = float(np.mean(track_f1s)) if track_f1s else 0.0
+    avg_peak_count = float(np.mean(peak_counts)) if peak_counts else 0.0
     micro_precision = total_matched / total_pred if total_pred else 0.0
     micro_recall = total_matched / total_true if total_true else 0.0
     micro_f1 = (
@@ -692,6 +696,7 @@ def evaluate(
         precision=precision,
         recall=recall,
         f1=f1,
+        avg_peak_count=avg_peak_count,
         macro_precision=macro_precision,
         macro_recall=macro_recall,
         macro_f1=macro_f1,
@@ -738,6 +743,7 @@ def write_log_header(path: Path) -> None:
                 "precision",
                 "recall",
                 "f1",
+                "avg_peak_count",
                 "macro_precision",
                 "macro_recall",
                 "macro_f1",
@@ -760,6 +766,7 @@ def append_log(path: Path, epoch: int, lr: float, train_loss: float, stats: Eval
                 stats.precision,
                 stats.recall,
                 stats.f1,
+                stats.avg_peak_count,
                 stats.macro_precision,
                 stats.macro_recall,
                 stats.macro_f1,
@@ -926,7 +933,7 @@ def main() -> None:
             f"Epoch {epoch:03d} | lr={lr:.6g} | train_loss={train_loss:.4f} "
             f"| val_loss={val_stats.loss:.4f} | "
             f"Precision={val_stats.precision:.4f} Recall={val_stats.recall:.4f} "
-            f"F1={val_stats.f1:.4f}"
+            f"F1={val_stats.f1:.4f} AvgPeaks={val_stats.avg_peak_count:.2f}"
         )
 
         if epochs_without_improvement >= args.early_stop_patience:
@@ -941,7 +948,8 @@ def main() -> None:
     print(
         "Best checkpoint test metrics | "
         f"Precision={test_stats.precision:.4f} Recall={test_stats.recall:.4f} "
-        f"F1={test_stats.f1:.4f} | loss={test_stats.loss:.4f}"
+        f"F1={test_stats.f1:.4f} AvgPeaks={test_stats.avg_peak_count:.2f} "
+        f"| loss={test_stats.loss:.4f}"
     )
     print(f"Saved outputs to {args.output_dir.resolve()}")
 
