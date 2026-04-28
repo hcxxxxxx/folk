@@ -128,6 +128,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--pos-weight",
+        type=float,
+        default=1.0,
+        help="Positive-class weight for BCEWithLogitsLoss. Increase when the model collapses to low boundary probabilities.",
+    )
+    parser.add_argument(
+        "--auto-pos-weight",
+        action="store_true",
+        help="Estimate BCE positive weight from folded training labels and override --pos-weight.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--early-stop-patience", type=int, default=5)
@@ -816,6 +827,18 @@ def cache_all_features(datasets: Dict[str, FolkBoundaryDataset]) -> None:
             _ = dataset[index]
 
 
+def estimate_pos_weight(dataset: FolkBoundaryDataset) -> float:
+    positive_mass = 0.0
+    total_mass = 0.0
+    for index in tqdm(range(len(dataset)), desc="estimate pos_weight"):
+        labels = dataset[index]["labels"]
+        positive_mass += float(labels.sum().item())
+        total_mass += float(labels.numel())
+    positive_mass = max(positive_mass, 1e-6)
+    negative_mass = max(total_mass - positive_mass, 1e-6)
+    return negative_mass / positive_mass
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -871,7 +894,9 @@ def main() -> None:
         lstm_dropout=args.lstm_dropout,
         init_boundary_prob=args.init_boundary_prob,
     ).to(device)
-    criterion = nn.BCEWithLogitsLoss()
+    pos_weight_value = estimate_pos_weight(datasets["train"]) if args.auto_pos_weight else args.pos_weight
+    pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=device)
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(
         optimizer,
@@ -884,7 +909,7 @@ def main() -> None:
         "Model: "
         f"fold_size={model.fold_size} frames ({model.fold_size * args.hop_length / args.sr:.3f}s), "
         f"dim_embed={args.dim_embed}, hidden={args.lstm_hidden_size}, "
-        f"layers={args.lstm_num_layers}"
+        f"layers={args.lstm_num_layers}, pos_weight={pos_weight_value:.4f}"
     )
 
     args_path = args.output_dir / "args.json"

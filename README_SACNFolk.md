@@ -50,6 +50,7 @@ python3 train_sacnfolk.py \
   --device cuda \
   --batch-size 1 \
   --lr 1e-3 \
+  --pos-weight 1.0 \
   --fold-time 1.0 \
   --dim-embed 24 \
   --lstm-hidden-size 128 \
@@ -77,5 +78,8 @@ The paper and author logs tune these heavily, so they are command-line args:
 - `--label-tolerance-sec`: positive label radius for training labels.
 - `--eval-tolerance-sec`: matching tolerance for reported P/R/F. Use `3.0`
   for HR3F and `0.5` for HR.5F.
+- `--pos-weight`: positive class weight for `BCEWithLogitsLoss`. Try larger
+  values when validation loss decreases but boundary F1 stays low.
+- `--auto-pos-weight`: estimate `--pos-weight` from the folded training labels.
 - `--peak-threshold`, `--peak-filter-size`: local-max post-processing.
 - `--metric-average`: `macro` or `micro` reporting/selection.
