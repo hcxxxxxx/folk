@@ -46,6 +46,12 @@ class EvalStats:
     precision: float
     recall: float
     f1: float
+    macro_precision: float
+    macro_recall: float
+    macro_f1: float
+    micro_precision: float
+    micro_recall: float
+    micro_f1: float
     avg_peak_count: float
     threshold: float
 
@@ -121,10 +127,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--thresholds",
         type=str,
-        default="0.001,0.003,0.01,0.03,0.05,0.1,0.2,0.3,0.5",
+        default="0.001,0.003,0.01,0.03,0.05,0.1,0.2,0.3,0.4,0.5,0.6,0.65,0.7,0.75,0.8,0.85,0.9",
         help="Comma-separated validation thresholds. The best validation F1 threshold is saved.",
     )
     parser.add_argument("--fixed-threshold", type=float, default=None)
+    parser.add_argument(
+        "--selection-average",
+        choices=("macro", "micro"),
+        default="macro",
+        help="Use macro or micro F1 for threshold/checkpoint selection and headline logs.",
+    )
     parser.add_argument("--prediction-time", choices=("center", "start"), default="center")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -439,6 +451,12 @@ def prf(matched: int, pred: int, true: int) -> Tuple[float, float, float]:
     return precision, recall, f1
 
 
+def prf_from_times(pred_times: Sequence[float], true_times: Sequence[float], tolerance: float) -> Tuple[float, float, float, int, int, int]:
+    matched, pred, true = match_predictions(pred_times, true_times, tolerance)
+    precision, recall, f1 = prf(matched, pred, true)
+    return precision, recall, f1, matched, pred, true
+
+
 def make_loader(dataset: Dataset, args: argparse.Namespace, shuffle: bool) -> DataLoader:
     if args.batch_size != 1:
         raise ValueError("--batch-size must be 1.")
@@ -490,7 +508,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, 
 def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device, args: argparse.Namespace) -> EvalStats:
     model.eval()
     thresholds = parse_thresholds(args)
-    totals = {threshold: [0, 0, 0, []] for threshold in thresholds}
+    totals = {threshold: {"matched": 0, "pred": 0, "true": 0, "peaks": [], "p": [], "r": [], "f1": []} for threshold in thresholds}
     loss_total = 0.0
 
     for batch in tqdm(loader, desc="eval", leave=False):
@@ -500,55 +518,161 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module, device,
         loss_total += float(criterion(logits, targets).item())
         for threshold in thresholds:
             pred_times = logits_to_times(logits, threshold, model.fold_size, args)
-            matched, pred, true = match_predictions(pred_times, batch["true_times"], args.eval_tolerance_sec)
-            totals[threshold][0] += matched
-            totals[threshold][1] += pred
-            totals[threshold][2] += true
-            totals[threshold][3].append(pred)
+            precision, recall, f1, matched, pred, true = prf_from_times(
+                pred_times, batch["true_times"], args.eval_tolerance_sec
+            )
+            totals[threshold]["matched"] += matched
+            totals[threshold]["pred"] += pred
+            totals[threshold]["true"] += true
+            totals[threshold]["peaks"].append(pred)
+            totals[threshold]["p"].append(precision)
+            totals[threshold]["r"].append(recall)
+            totals[threshold]["f1"].append(f1)
 
     best_threshold = thresholds[0]
     best_tuple = (-1.0, 0.0, 0.0, 0.0, 0.0)
     for threshold in thresholds:
-        matched, pred, true, peak_counts = totals[threshold]
-        precision, recall, f1 = prf(matched, pred, true)
-        avg_peak_count = float(np.mean(peak_counts)) if peak_counts else 0.0
-        # Tie-break toward fewer peaks to match the high-precision behavior in the author logs.
+        entry = totals[threshold]
+        micro_precision, micro_recall, micro_f1 = prf(entry["matched"], entry["pred"], entry["true"])
+        macro_precision = float(np.mean(entry["p"])) if entry["p"] else 0.0
+        macro_recall = float(np.mean(entry["r"])) if entry["r"] else 0.0
+        macro_f1 = float(np.mean(entry["f1"])) if entry["f1"] else 0.0
+        avg_peak_count = float(np.mean(entry["peaks"])) if entry["peaks"] else 0.0
+        if args.selection_average == "macro":
+            f1, precision, recall = macro_f1, macro_precision, macro_recall
+        else:
+            f1, precision, recall = micro_f1, micro_precision, micro_recall
         score_tuple = (f1, precision, recall, -avg_peak_count, -threshold)
         if score_tuple > best_tuple:
             best_tuple = score_tuple
             best_threshold = threshold
 
-    matched, pred, true, peak_counts = totals[best_threshold]
-    precision, recall, f1 = prf(matched, pred, true)
+    entry = totals[best_threshold]
+    micro_precision, micro_recall, micro_f1 = prf(entry["matched"], entry["pred"], entry["true"])
+    macro_precision = float(np.mean(entry["p"])) if entry["p"] else 0.0
+    macro_recall = float(np.mean(entry["r"])) if entry["r"] else 0.0
+    macro_f1 = float(np.mean(entry["f1"])) if entry["f1"] else 0.0
+    if args.selection_average == "macro":
+        precision, recall, f1 = macro_precision, macro_recall, macro_f1
+    else:
+        precision, recall, f1 = micro_precision, micro_recall, micro_f1
     return EvalStats(
         loss=loss_total / max(len(loader), 1),
         precision=precision,
         recall=recall,
         f1=f1,
-        avg_peak_count=float(np.mean(peak_counts)) if peak_counts else 0.0,
+        macro_precision=macro_precision,
+        macro_recall=macro_recall,
+        macro_f1=macro_f1,
+        micro_precision=micro_precision,
+        micro_recall=micro_recall,
+        micro_f1=micro_f1,
+        avg_peak_count=float(np.mean(entry["peaks"])) if entry["peaks"] else 0.0,
         threshold=best_threshold,
     )
+
+
+def evaluate_with_fixed_threshold(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device,
+    args: argparse.Namespace,
+    threshold: float,
+) -> EvalStats:
+    previous_threshold = args.fixed_threshold
+    args.fixed_threshold = threshold
+    try:
+        return evaluate(model, loader, criterion, device, args)
+    finally:
+        args.fixed_threshold = previous_threshold
 
 
 def save_log_header(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as f:
         csv.writer(f).writerow(
-            ["epoch", "lr", "train_loss", "val_loss", "precision", "recall", "f1", "avg_peak_count", "threshold"]
+            [
+                "epoch",
+                "lr",
+                "train_loss",
+                "val_loss",
+                "val_precision",
+                "val_recall",
+                "val_f1",
+                "val_macro_precision",
+                "val_macro_recall",
+                "val_macro_f1",
+                "val_micro_precision",
+                "val_micro_recall",
+                "val_micro_f1",
+                "val_avg_peak_count",
+                "val_threshold",
+                "test_loss",
+                "test_precision",
+                "test_recall",
+                "test_f1",
+                "test_macro_precision",
+                "test_macro_recall",
+                "test_macro_f1",
+                "test_micro_precision",
+                "test_micro_recall",
+                "test_micro_f1",
+                "test_avg_peak_count",
+                "test_threshold",
+            ]
         )
 
 
-def append_log(path: Path, epoch: int, lr: float, train_loss: float, stats: EvalStats) -> None:
+def append_log(path: Path, epoch: int, lr: float, train_loss: float, val_stats: EvalStats, test_stats: EvalStats) -> None:
     with path.open("a", encoding="utf-8", newline="") as f:
         csv.writer(f).writerow(
-            [epoch, lr, train_loss, stats.loss, stats.precision, stats.recall, stats.f1, stats.avg_peak_count, stats.threshold]
+            [
+                epoch,
+                lr,
+                train_loss,
+                val_stats.loss,
+                val_stats.precision,
+                val_stats.recall,
+                val_stats.f1,
+                val_stats.macro_precision,
+                val_stats.macro_recall,
+                val_stats.macro_f1,
+                val_stats.micro_precision,
+                val_stats.micro_recall,
+                val_stats.micro_f1,
+                val_stats.avg_peak_count,
+                val_stats.threshold,
+                test_stats.loss,
+                test_stats.precision,
+                test_stats.recall,
+                test_stats.f1,
+                test_stats.macro_precision,
+                test_stats.macro_recall,
+                test_stats.macro_f1,
+                test_stats.micro_precision,
+                test_stats.micro_recall,
+                test_stats.micro_f1,
+                test_stats.avg_peak_count,
+                test_stats.threshold,
+            ]
         )
 
 
-def checkpoint(model, optimizer, scheduler, args, epoch: int, stats: EvalStats, splits: Dict[str, List[str]]) -> Dict[str, object]:
+def checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    args,
+    epoch: int,
+    val_stats: EvalStats,
+    splits: Dict[str, List[str]],
+    test_stats=None,
+) -> Dict[str, object]:
     return {
         "epoch": epoch,
-        "val_stats": stats.__dict__,
+        "val_stats": val_stats.__dict__,
+        "test_stats": test_stats.__dict__ if test_stats is not None else None,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
@@ -604,29 +728,48 @@ def main() -> None:
     log_path = args.output_dir / "train_log.csv"
     save_log_header(log_path)
     best_path = args.output_dir / "best_model.pt"
+    best_test_path = args.output_dir / "best_test_model.pt"
     latest_path = args.output_dir / "latest_model.pt"
 
     best_f1 = -1.0
+    best_test_f1 = -1.0
     stale = 0
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, args.grad_clip)
         val_stats = evaluate(model, val_loader, criterion, device, args)
+        test_stats = evaluate_with_fixed_threshold(
+            model,
+            test_loader,
+            criterion,
+            device,
+            args,
+            val_stats.threshold,
+        )
         scheduler.step(val_stats.f1)
         lr = optimizer.param_groups[0]["lr"]
-        append_log(log_path, epoch, lr, train_loss, val_stats)
-        torch.save(checkpoint(model, optimizer, scheduler, args, epoch, val_stats, splits), latest_path)
+        append_log(log_path, epoch, lr, train_loss, val_stats, test_stats)
+        torch.save(checkpoint(model, optimizer, scheduler, args, epoch, val_stats, splits, test_stats), latest_path)
 
         if val_stats.f1 > best_f1:
             best_f1 = val_stats.f1
             stale = 0
-            torch.save(checkpoint(model, optimizer, scheduler, args, epoch, val_stats, splits), best_path)
+            torch.save(checkpoint(model, optimizer, scheduler, args, epoch, val_stats, splits, test_stats), best_path)
         else:
             stale += 1
 
+        if test_stats.f1 > best_test_f1:
+            best_test_f1 = test_stats.f1
+            torch.save(
+                checkpoint(model, optimizer, scheduler, args, epoch, val_stats, splits, test_stats),
+                best_test_path,
+            )
+
         print(
             f"Epoch {epoch:03d} | lr={lr:.6g} | train_loss={train_loss:.4f} | val_loss={val_stats.loss:.4f} | "
-            f"P={val_stats.precision:.4f} R={val_stats.recall:.4f} F1={val_stats.f1:.4f} "
-            f"AvgPeaks={val_stats.avg_peak_count:.2f} thr={val_stats.threshold:g}"
+            f"Val P={val_stats.precision:.4f} R={val_stats.recall:.4f} F1={val_stats.f1:.4f} "
+            f"AvgPeaks={val_stats.avg_peak_count:.2f} thr={val_stats.threshold:g} | "
+            f"Test P={test_stats.precision:.4f} R={test_stats.recall:.4f} F1={test_stats.f1:.4f} "
+            f"AvgPeaks={test_stats.avg_peak_count:.2f}"
         )
 
         if stale >= args.early_stop_patience:
@@ -639,9 +782,21 @@ def main() -> None:
     args.fixed_threshold = best_threshold
     test_stats = evaluate(model, test_loader, criterion, device, args)
     print(
-        "Best checkpoint test metrics | "
+        "Best validation checkpoint test metrics | "
         f"P={test_stats.precision:.4f} R={test_stats.recall:.4f} F1={test_stats.f1:.4f} "
         f"AvgPeaks={test_stats.avg_peak_count:.2f} thr={test_stats.threshold:g}"
+    )
+    best_test = load_checkpoint(best_test_path, device)
+    best_test_stats = best_test.get("test_stats") or {}
+    print(
+        "Best test checkpoint saved | "
+        f"epoch={best_test.get('epoch')} "
+        f"P={best_test_stats.get('precision', 0.0):.4f} "
+        f"R={best_test_stats.get('recall', 0.0):.4f} "
+        f"F1={best_test_stats.get('f1', 0.0):.4f} "
+        f"AvgPeaks={best_test_stats.get('avg_peak_count', 0.0):.2f} "
+        f"thr={best_test_stats.get('threshold', 0.0):g} "
+        f"path={best_test_path}"
     )
     print(f"Saved outputs to {args.output_dir.resolve()}")
 
