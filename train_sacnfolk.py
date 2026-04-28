@@ -162,6 +162,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peak-threshold", type=float, default=0.001)
     parser.add_argument("--peak-step", type=int, default=1)
     parser.add_argument(
+        "--max-peaks-per-song",
+        type=int,
+        default=0,
+        help="Keep only the top-K post-processed peaks per song. 0 disables the cap.",
+    )
+    parser.add_argument(
+        "--min-peak-distance-sec",
+        type=float,
+        default=0.0,
+        help="Minimum distance between kept peaks after thresholding. 0 disables distance filtering.",
+    )
+    parser.add_argument(
         "--prediction-time",
         choices=("center", "start"),
         default="center",
@@ -578,7 +590,28 @@ def logits_to_pred_times(
 ) -> List[float]:
     probs = torch.sigmoid(logits.detach().float().cpu())
     peaks = local_maxima(probs, filter_size=args.peak_filter_size, step=args.peak_step)
-    pred_indices = torch.nonzero(peaks >= args.peak_threshold, as_tuple=False).flatten().tolist()
+    candidate_indices = torch.nonzero(peaks >= args.peak_threshold, as_tuple=False).flatten()
+    if candidate_indices.numel() == 0:
+        return []
+
+    candidate_scores = peaks[candidate_indices]
+    sorted_order = torch.argsort(candidate_scores, descending=True)
+    sorted_indices = candidate_indices[sorted_order].tolist()
+
+    frame_duration = args.hop_length / args.sr
+    min_distance_frames = 0
+    if args.min_peak_distance_sec > 0:
+        min_distance_frames = int(args.min_peak_distance_sec / (fold_size * frame_duration))
+
+    pred_indices: List[int] = []
+    for index in sorted_indices:
+        if min_distance_frames > 0 and any(abs(index - kept) < min_distance_frames for kept in pred_indices):
+            continue
+        pred_indices.append(index)
+        if args.max_peaks_per_song > 0 and len(pred_indices) >= args.max_peaks_per_song:
+            break
+
+    pred_indices.sort()
     return prediction_indices_to_times(
         indices=pred_indices,
         fold_size=fold_size,
