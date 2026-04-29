@@ -22,10 +22,12 @@ import math
 import posixpath
 import random
 import re
+import sys
 import wave
 import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -68,6 +70,43 @@ class InstrumentalLoadStats:
     missing_title: int = 0
     removed_start_boundaries: int = 0
     removed_end_boundaries: int = 0
+
+
+class TeeStream:
+    def __init__(self, primary, log_file):
+        self.primary = primary
+        self.log_file = log_file
+
+    def write(self, text: str) -> int:
+        self.primary.write(text)
+        self.log_file.write(text)
+        self.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return self.primary.isatty()
+
+    def fileno(self) -> int:
+        return self.primary.fileno()
+
+    def __getattr__(self, name: str):
+        return getattr(self.primary, name)
+
+
+def setup_console_logging(log_group: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path(__file__).resolve().parent / "logs" / log_group
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"log_{timestamp}"
+    log_file = log_path.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = TeeStream(sys.stdout, log_file)
+    sys.stderr = TeeStream(sys.stderr, log_file)
+    print(f"Console log: {log_path}")
+    return log_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -562,6 +601,7 @@ def print_split_summary(
 
 def main() -> None:
     args = parse_args()
+    setup_console_logging("optimized")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(args.seed)
 

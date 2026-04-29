@@ -17,9 +17,11 @@ train/val/test parts are merged.
 from __future__ import annotations
 
 import argparse
+import sys
 import csv
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -52,6 +54,43 @@ from train_sacnfolk_peak_mixed import (
     print_split_summary,
     source_prefix_records,
 )
+
+
+class TeeStream:
+    def __init__(self, primary, log_file):
+        self.primary = primary
+        self.log_file = log_file
+
+    def write(self, text: str) -> int:
+        self.primary.write(text)
+        self.log_file.write(text)
+        self.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return self.primary.isatty()
+
+    def fileno(self) -> int:
+        return self.primary.fileno()
+
+    def __getattr__(self, name: str):
+        return getattr(self.primary, name)
+
+
+def setup_console_logging(log_group: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_dir = Path(__file__).resolve().parent / "logs" / log_group
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"log_{timestamp}"
+    log_file = log_path.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = TeeStream(sys.stdout, log_file)
+    sys.stderr = TeeStream(sys.stderr, log_file)
+    print(f"Console log: {log_path}")
+    return log_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -265,6 +304,7 @@ def append_test_log(path: Path, epoch: int, lr: float, train_loss: float, val_st
 
 def main() -> None:
     args = parse_args()
+    setup_console_logging("baseline")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(args.seed)
 
