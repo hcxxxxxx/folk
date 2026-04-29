@@ -73,15 +73,32 @@ class InstrumentalLoadStats:
 
 
 class TeeStream:
-    def __init__(self, primary, log_file):
+    def __init__(self, primary, log_file, filter_carriage: bool = False):
         self.primary = primary
         self.log_file = log_file
+        self.filter_carriage = filter_carriage
+        self._line_buffer = ""
 
     def write(self, text: str) -> int:
         self.primary.write(text)
-        self.log_file.write(text)
+        if self.filter_carriage:
+            self._write_log_without_progress_refreshes(text)
+        else:
+            self.log_file.write(text)
         self.flush()
         return len(text)
+
+    def _write_log_without_progress_refreshes(self, text: str) -> None:
+        for char in text:
+            if char == "\r":
+                self._line_buffer = ""
+            elif char == "\n":
+                if self._line_buffer:
+                    self.log_file.write(self._line_buffer)
+                    self._line_buffer = ""
+                self.log_file.write("\n")
+            else:
+                self._line_buffer += char
 
     def flush(self) -> None:
         self.primary.flush()
@@ -104,9 +121,16 @@ def setup_console_logging(log_group: str) -> Path:
     log_path = log_dir / f"log_{timestamp}"
     log_file = log_path.open("a", encoding="utf-8", buffering=1)
     sys.stdout = TeeStream(sys.stdout, log_file)
-    sys.stderr = TeeStream(sys.stderr, log_file)
+    sys.stderr = TeeStream(sys.stderr, log_file, filter_carriage=True)
     print(f"Console log: {log_path}")
     return log_path
+
+
+def print_run_parameters(args: argparse.Namespace) -> None:
+    print("Run parameters:")
+    for key in sorted(vars(args)):
+        value = getattr(args, key)
+        print(f"  --{key.replace('_', '-')} {value}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -602,6 +626,7 @@ def print_split_summary(
 def main() -> None:
     args = parse_args()
     setup_console_logging("optimized")
+    print_run_parameters(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     seed_everything(args.seed)
 
@@ -617,6 +642,9 @@ def main() -> None:
 
     if args.dry_run:
         print("Dry run OK.")
+        return
+    if args.epochs <= 0:
+        print("No training was run because --epochs <= 0. Use --dry-run for setup checks.")
         return
 
     train_loader = make_loader(train_set, args, shuffle=True)
