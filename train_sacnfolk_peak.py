@@ -733,6 +733,8 @@ def main() -> None:
 
     best_f1 = -1.0
     best_test_f1 = -1.0
+    best_val_epoch = 0
+    best_test_epoch = 0
     stale = 0
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, args.grad_clip)
@@ -752,6 +754,7 @@ def main() -> None:
 
         if val_stats.f1 > best_f1:
             best_f1 = val_stats.f1
+            best_val_epoch = epoch
             stale = 0
             torch.save(checkpoint(model, optimizer, scheduler, args, epoch, val_stats, splits, test_stats), best_path)
         else:
@@ -759,6 +762,7 @@ def main() -> None:
 
         if test_stats.f1 > best_test_f1:
             best_test_f1 = test_stats.f1
+            best_test_epoch = epoch
             torch.save(
                 checkpoint(model, optimizer, scheduler, args, epoch, val_stats, splits, test_stats),
                 best_test_path,
@@ -797,6 +801,11 @@ def main() -> None:
         f"AvgPeaks={best_test_stats.get('avg_peak_count', 0.0):.2f} "
         f"thr={best_test_stats.get('threshold', 0.0):g} "
         f"path={best_test_path}"
+    )
+    print(
+        "Training best F1 summary | "
+        f"best_val_epoch={best_val_epoch} best_val_f1={best_f1:.4f} | "
+        f"best_test_epoch={best_test_epoch} best_test_f1={best_test_f1:.4f}"
     )
     print(f"Saved outputs to {args.output_dir.resolve()}")
 
