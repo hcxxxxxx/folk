@@ -99,7 +99,7 @@ class TeeStream:
 
 
 def setup_console_logging(log_group: str) -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     log_dir = Path(__file__).resolve().parent / "logs" / log_group
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"log_{timestamp}"
