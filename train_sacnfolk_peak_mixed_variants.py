@@ -153,9 +153,32 @@ class MultiScaleTemporalContext(nn.Module):
         return self.norm(residual + self.dropout(context))
 
 
+class BoundaryMLPHead(nn.Module):
+    """A small nonlinear boundary classifier over contextual frame features."""
+
+    def __init__(self, channels: int, dropout: float, prior: float):
+        super().__init__()
+        hidden = max(channels, 32)
+        self.net = nn.Sequential(
+            nn.LayerNorm(channels),
+            nn.Linear(channels, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.xavier_uniform_(self.net[1].weight)
+        nn.init.zeros_(self.net[1].bias)
+        nn.init.normal_(self.net[-1].weight, std=0.01)
+        nn.init.constant_(self.net[-1].bias, math.log(prior / (1 - prior)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class VariantPeakSACNFolk(nn.Module):
     embedding_cls: Type[nn.Module] = OriginalFeatureEmbedding
     use_multiscale_context = False
+    use_mlp_classifier = False
 
     def __init__(self, args):
         super().__init__()
@@ -175,10 +198,13 @@ class VariantPeakSACNFolk(nn.Module):
             if self.use_multiscale_context
             else nn.Identity()
         )
-        self.classifier = nn.Linear(lstm_channels, 1)
         prior = min(max(args.init_boundary_prob, 1e-6), 1 - 1e-6)
-        nn.init.normal_(self.classifier.weight, std=0.01)
-        nn.init.constant_(self.classifier.bias, math.log(prior / (1 - prior)))
+        if self.use_mlp_classifier:
+            self.classifier = BoundaryMLPHead(lstm_channels, args.dropout, prior)
+        else:
+            self.classifier = nn.Linear(lstm_channels, 1)
+            nn.init.normal_(self.classifier.weight, std=0.01)
+            nn.init.constant_(self.classifier.bias, math.log(prior / (1 - prior)))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         if features.dim() == 2:
@@ -203,6 +229,12 @@ class StrongCNNPeakSACNFolk(VariantPeakSACNFolk):
 class MultiScaleStrongCNNPeakSACNFolk(VariantPeakSACNFolk):
     embedding_cls = StrongFeatureEmbedding
     use_multiscale_context = True
+
+
+class MultiScaleStrongCNNMLPHeadPeakSACNFolk(VariantPeakSACNFolk):
+    embedding_cls = StrongFeatureEmbedding
+    use_multiscale_context = True
+    use_mlp_classifier = True
 
 
 def run_training(model_cls: Type[nn.Module], variant_name: str) -> None:
