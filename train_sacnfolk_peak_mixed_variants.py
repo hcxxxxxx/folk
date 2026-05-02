@@ -175,10 +175,59 @@ class BoundaryMLPHead(nn.Module):
         return self.net(x)
 
 
+class BoundaryContrastContext(nn.Module):
+    """Multi-scale left/right context contrast for boundary candidates.
+
+    Variation boundaries are often marked by a change between the material just
+    before and just after a candidate point.  This module computes pooled left
+    and right context at several temporal scales, then feeds their signed and
+    absolute differences back into the boundary representation.
+    """
+
+    def __init__(self, channels: int, dropout: float, scales=(4, 8, 16)):
+        super().__init__()
+        self.scales = tuple(int(scale) for scale in scales)
+        in_channels = channels * (1 + 2 * len(self.scales))
+        self.project = nn.Sequential(
+            nn.LayerNorm(in_channels),
+            nn.Linear(in_channels, channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.norm = nn.LayerNorm(channels)
+
+    @staticmethod
+    def _window_mean(x: torch.Tensor, start_offset: int, end_offset: int) -> torch.Tensor:
+        bsz, steps, channels = x.shape
+        positions = torch.arange(steps, device=x.device)
+        starts = (positions + start_offset).clamp(0, steps)
+        ends = (positions + end_offset).clamp(0, steps)
+        ends = torch.maximum(ends, starts + 1).clamp(0, steps)
+        starts = torch.minimum(starts, ends - 1).clamp(0, steps)
+
+        padded = torch.cat([x.new_zeros(bsz, 1, channels), x.cumsum(dim=1)], dim=1)
+        gather_shape = (1, steps, 1)
+        expand_shape = (bsz, steps, channels)
+        start_values = padded.gather(1, starts.add(1).view(gather_shape).expand(expand_shape))
+        end_values = padded.gather(1, ends.view(gather_shape).expand(expand_shape))
+        counts = (ends - starts).clamp_min(1).to(x.dtype).view(1, steps, 1)
+        return (end_values - start_values) / counts
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = [x]
+        for scale in self.scales:
+            left = self._window_mean(x, -scale, 0)
+            right = self._window_mean(x, 1, scale + 1)
+            delta = right - left
+            features.extend([delta, delta.abs()])
+        return self.norm(x + self.project(torch.cat(features, dim=-1)))
+
+
 class VariantPeakSACNFolk(nn.Module):
     embedding_cls: Type[nn.Module] = OriginalFeatureEmbedding
     use_multiscale_context = False
     use_mlp_classifier = False
+    use_boundary_contrast = False
 
     def __init__(self, args):
         super().__init__()
@@ -198,6 +247,11 @@ class VariantPeakSACNFolk(nn.Module):
             if self.use_multiscale_context
             else nn.Identity()
         )
+        self.boundary_contrast = (
+            BoundaryContrastContext(lstm_channels, args.dropout)
+            if self.use_boundary_contrast
+            else nn.Identity()
+        )
         prior = min(max(args.init_boundary_prob, 1e-6), 1 - 1e-6)
         if self.use_mlp_classifier:
             self.classifier = BoundaryMLPHead(lstm_channels, args.dropout, prior)
@@ -215,6 +269,7 @@ class VariantPeakSACNFolk(nn.Module):
         x = x[:, : n_fold * self.fold_size].reshape(bsz, n_fold, self.fold_size * channels)
         x, _ = self.lstm(x)
         x = self.temporal_context(x)
+        x = self.boundary_contrast(x)
         return self.classifier(x).squeeze(-1)
 
 
@@ -234,6 +289,13 @@ class MultiScaleStrongCNNPeakSACNFolk(VariantPeakSACNFolk):
 class MultiScaleStrongCNNMLPHeadPeakSACNFolk(VariantPeakSACNFolk):
     embedding_cls = StrongFeatureEmbedding
     use_multiscale_context = True
+    use_mlp_classifier = True
+
+
+class MultiScaleStrongCNNBoundaryContrastMLPHeadPeakSACNFolk(VariantPeakSACNFolk):
+    embedding_cls = StrongFeatureEmbedding
+    use_multiscale_context = True
+    use_boundary_contrast = True
     use_mlp_classifier = True
 
 
