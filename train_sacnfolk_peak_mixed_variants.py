@@ -153,6 +153,79 @@ class MultiScaleTemporalContext(nn.Module):
         return self.norm(residual + self.dropout(context))
 
 
+class TemporalResidualBlock(nn.Module):
+    """Residual Conv1D block used by the hierarchical temporal encoder."""
+
+    def __init__(self, channels: int, dilation: int, dropout: float):
+        super().__init__()
+        self.conv0 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.norm0 = nn.GroupNorm(group_count(channels), channels)
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=3, padding=dilation, dilation=dilation)
+        self.norm1 = nn.GroupNorm(group_count(channels), channels)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.dropout(F.gelu(self.norm0(self.conv0(x))))
+        x = self.dropout(self.norm1(self.conv1(x)))
+        return F.gelu(x + residual)
+
+
+class HierarchicalMultiscaleTemporalEncoder(nn.Module):
+    """Hierarchical temporal encoder for boundary-level music structure cues.
+
+    The normal multi-scale module only applies several dilated convolutions at
+    the original folded resolution.  This encoder is more explicit: it keeps a
+    full-resolution local branch, builds a phrase branch after 4x temporal
+    pooling, builds a section branch after 16x pooling, then upsamples and fuses
+    all branches with a learned gate.
+    """
+
+    def __init__(self, channels: int, dropout: float, phrase_pool: int = 4, section_pool: int = 16):
+        super().__init__()
+        self.phrase_pool = int(phrase_pool)
+        self.section_pool = int(section_pool)
+        branch_dropout = min(dropout, 0.15)
+        self.local_branch = nn.Sequential(
+            TemporalResidualBlock(channels, dilation=1, dropout=branch_dropout),
+            TemporalResidualBlock(channels, dilation=2, dropout=branch_dropout),
+        )
+        self.phrase_branch = nn.Sequential(
+            TemporalResidualBlock(channels, dilation=1, dropout=branch_dropout),
+            TemporalResidualBlock(channels, dilation=2, dropout=branch_dropout),
+            TemporalResidualBlock(channels, dilation=4, dropout=branch_dropout),
+        )
+        self.section_branch = nn.Sequential(
+            TemporalResidualBlock(channels, dilation=1, dropout=branch_dropout),
+            TemporalResidualBlock(channels, dilation=2, dropout=branch_dropout),
+            TemporalResidualBlock(channels, dilation=4, dropout=branch_dropout),
+        )
+        fused_channels = channels * 4
+        self.project = nn.Conv1d(fused_channels, channels, kernel_size=1)
+        self.gate = nn.Conv1d(fused_channels, channels, kernel_size=1)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(channels)
+
+    @staticmethod
+    def _pooled_branch(x: torch.Tensor, pool_size: int, branch: nn.Module, target_steps: int) -> torch.Tensor:
+        pooled = F.avg_pool1d(x, kernel_size=pool_size, stride=pool_size, ceil_mode=True)
+        pooled = branch(pooled)
+        return F.interpolate(pooled, size=target_steps, mode="linear", align_corners=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        steps = x.shape[1]
+        x_t = x.transpose(1, 2)
+        local = self.local_branch(x_t)
+        phrase = self._pooled_branch(x_t, self.phrase_pool, self.phrase_branch, steps)
+        section = self._pooled_branch(x_t, self.section_pool, self.section_branch, steps)
+        fused_input = torch.cat([x_t, local, phrase, section], dim=1)
+        fused = self.project(fused_input)
+        gate = torch.sigmoid(self.gate(fused_input))
+        fused = (gate * fused).transpose(1, 2)
+        return self.norm(residual + self.dropout(fused))
+
+
 class BoundaryMLPHead(nn.Module):
     """A small nonlinear boundary classifier over contextual frame features."""
 
@@ -226,6 +299,7 @@ class BoundaryContrastContext(nn.Module):
 class VariantPeakSACNFolk(nn.Module):
     embedding_cls: Type[nn.Module] = OriginalFeatureEmbedding
     use_multiscale_context = False
+    use_hierarchical_temporal = False
     use_mlp_classifier = False
     use_boundary_contrast = False
 
@@ -242,11 +316,12 @@ class VariantPeakSACNFolk(nn.Module):
             dropout=args.lstm_dropout if args.lstm_num_layers > 1 else 0.0,
         )
         lstm_channels = args.lstm_hidden_size * 2
-        self.temporal_context = (
-            MultiScaleTemporalContext(lstm_channels, args.dropout)
-            if self.use_multiscale_context
-            else nn.Identity()
-        )
+        if self.use_hierarchical_temporal:
+            self.temporal_context = HierarchicalMultiscaleTemporalEncoder(lstm_channels, args.dropout)
+        elif self.use_multiscale_context:
+            self.temporal_context = MultiScaleTemporalContext(lstm_channels, args.dropout)
+        else:
+            self.temporal_context = nn.Identity()
         self.boundary_contrast = (
             BoundaryContrastContext(lstm_channels, args.dropout)
             if self.use_boundary_contrast
@@ -295,6 +370,13 @@ class MultiScaleStrongCNNMLPHeadPeakSACNFolk(VariantPeakSACNFolk):
 class MultiScaleStrongCNNBoundaryContrastMLPHeadPeakSACNFolk(VariantPeakSACNFolk):
     embedding_cls = StrongFeatureEmbedding
     use_multiscale_context = True
+    use_boundary_contrast = True
+    use_mlp_classifier = True
+
+
+class HierarchicalTemporalStrongCNNBoundaryContrastMLPHeadPeakSACNFolk(VariantPeakSACNFolk):
+    embedding_cls = StrongFeatureEmbedding
+    use_hierarchical_temporal = True
     use_boundary_contrast = True
     use_mlp_classifier = True
 
