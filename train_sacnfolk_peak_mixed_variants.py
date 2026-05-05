@@ -226,6 +226,114 @@ class HierarchicalMultiscaleTemporalEncoder(nn.Module):
         return self.norm(residual + self.dropout(fused))
 
 
+def attention_head_count(channels: int) -> int:
+    for heads in (8, 4, 2, 1):
+        if channels % heads == 0:
+            return heads
+    return 1
+
+
+class ConformerFeedForward(nn.Module):
+    def __init__(self, channels: int, dropout: float, expansion: int = 2):
+        super().__init__()
+        hidden = channels * expansion
+        self.net = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, channels),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class LightweightConformerBlock(nn.Module):
+    """Small Conformer-style block for limited-data audio boundary detection."""
+
+    def __init__(self, channels: int, dropout: float, conv_kernel_size: int = 15):
+        super().__init__()
+        if conv_kernel_size % 2 != 1:
+            raise ValueError("conv_kernel_size must be odd.")
+        self.ffn0_norm = nn.LayerNorm(channels)
+        self.ffn0 = ConformerFeedForward(channels, dropout)
+        self.attn_norm = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(
+            channels,
+            num_heads=attention_head_count(channels),
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.attn_dropout = nn.Dropout(dropout)
+        self.conv_norm = nn.LayerNorm(channels)
+        self.conv = nn.Sequential(
+            nn.Conv1d(channels, channels * 2, kernel_size=1),
+            nn.GLU(dim=1),
+            nn.Conv1d(
+                channels,
+                channels,
+                kernel_size=conv_kernel_size,
+                padding=conv_kernel_size // 2,
+                groups=channels,
+            ),
+            nn.GroupNorm(group_count(channels), channels),
+            nn.SiLU(),
+            nn.Conv1d(channels, channels, kernel_size=1),
+        )
+        self.conv_dropout = nn.Dropout(dropout)
+        self.ffn1_norm = nn.LayerNorm(channels)
+        self.ffn1 = ConformerFeedForward(channels, dropout)
+        self.final_norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + 0.5 * self.ffn0(self.ffn0_norm(x))
+        attn_input = self.attn_norm(x)
+        attn_out, _ = self.attn(attn_input, attn_input, attn_input, need_weights=False)
+        x = x + self.attn_dropout(attn_out)
+        conv_out = self.conv(self.conv_norm(x).transpose(1, 2)).transpose(1, 2)
+        x = x + self.conv_dropout(conv_out)
+        x = x + 0.5 * self.ffn1(self.ffn1_norm(x))
+        return self.final_norm(x)
+
+
+class TCNConformerTemporalEncoder(nn.Module):
+    """Temporal encoder that replaces BiLSTM with TCN + lightweight Conformer."""
+
+    def __init__(self, input_size: int, channels: int, dropout: float):
+        super().__init__()
+        block_dropout = min(dropout, 0.15)
+        self.input_projection = nn.Sequential(
+            nn.LayerNorm(input_size),
+            nn.Linear(input_size, channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+        self.tcn_blocks = nn.ModuleList(
+            [
+                TemporalResidualBlock(channels, dilation=1, dropout=block_dropout),
+                TemporalResidualBlock(channels, dilation=2, dropout=block_dropout),
+                TemporalResidualBlock(channels, dilation=4, dropout=block_dropout),
+                TemporalResidualBlock(channels, dilation=8, dropout=block_dropout),
+            ]
+        )
+        self.conformer_blocks = nn.ModuleList(
+            [LightweightConformerBlock(channels, dropout=dropout) for _ in range(2)]
+        )
+        self.output_norm = nn.LayerNorm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_projection(x)
+        residual = x
+        x_t = x.transpose(1, 2)
+        for block in self.tcn_blocks:
+            x_t = block(x_t)
+        x = x_t.transpose(1, 2)
+        for block in self.conformer_blocks:
+            x = block(x)
+        return self.output_norm(x + residual)
+
+
 class BoundaryMLPHead(nn.Module):
     """A small nonlinear boundary classifier over contextual frame features."""
 
@@ -379,6 +487,35 @@ class HierarchicalTemporalStrongCNNBoundaryContrastMLPHeadPeakSACNFolk(VariantPe
     use_hierarchical_temporal = True
     use_boundary_contrast = True
     use_mlp_classifier = True
+
+
+class TCNConformerStrongCNNBoundaryContrastMLPHeadPeakSACNFolk(nn.Module):
+    """Strong CNN model where TCN/Conformer replaces the BiLSTM backend."""
+
+    def __init__(self, args):
+        super().__init__()
+        self.fold_size = max(1, int(args.fold_time / (args.hop_length / args.sr)))
+        self.embedding = StrongFeatureEmbedding(args.dim_embed, args.dropout)
+        temporal_channels = args.lstm_hidden_size * 2
+        self.temporal_encoder = TCNConformerTemporalEncoder(
+            input_size=args.dim_embed * self.fold_size,
+            channels=temporal_channels,
+            dropout=args.dropout,
+        )
+        self.boundary_contrast = BoundaryContrastContext(temporal_channels, args.dropout)
+        prior = min(max(args.init_boundary_prob, 1e-6), 1 - 1e-6)
+        self.classifier = BoundaryMLPHead(temporal_channels, args.dropout, prior)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        if features.dim() == 2:
+            features = features.unsqueeze(0)
+        x = self.embedding(features.unsqueeze(1))
+        bsz, frames, channels = x.shape
+        n_fold = frames // self.fold_size
+        x = x[:, : n_fold * self.fold_size].reshape(bsz, n_fold, self.fold_size * channels)
+        x = self.temporal_encoder(x)
+        x = self.boundary_contrast(x)
+        return self.classifier(x).squeeze(-1)
 
 
 def run_training(model_cls: Type[nn.Module], variant_name: str) -> None:
