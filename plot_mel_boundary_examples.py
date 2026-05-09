@@ -320,19 +320,51 @@ def choose_error_panels(rows: Sequence[Dict[str, object]], cli_args: argparse.Na
 
     if cli_args.false_positive_filename:
         fp_row = require_row(rows, cli_args.false_positive_filename)
+        if fp_row["fp_count"] == 0 or fp_row["fn_count"] != 0:
+            raise ValueError(
+                f"{cli_args.false_positive_filename!r} is not a pure false-positive example: "
+                f"FP={fp_row['fp_count']}, FN={fp_row['fn_count']}, F1={fp_row['f1']:.4f}"
+            )
     else:
-        fp_candidates = [row for row in rows if row["fp_count"] > 0]
+        fp_candidates = [
+            row
+            for row in rows
+            if row["fp_count"] > 0 and row["fn_count"] == 0 and row["matched"] > 0 and row["f1"] > 0
+        ]
         if not fp_candidates:
-            raise ValueError("No false-positive example was found in this split.")
-        fp_row = sorted(fp_candidates, key=lambda row: (row["fp_count"], row["f1"]), reverse=True)[0]
+            raise ValueError(
+                "No pure false-positive example was found in this split "
+                "(need FP>0, FN=0, matched>0). You can pass --false-positive-filename explicitly."
+            )
+        fp_row = sorted(
+            fp_candidates,
+            key=lambda row: (row["fp_count"], row["true_count"], row["f1"]),
+            reverse=True,
+        )[0]
 
     if cli_args.false_negative_filename:
         fn_row = require_row(rows, cli_args.false_negative_filename)
+        if fn_row["fn_count"] == 0 or fn_row["fp_count"] != 0 or fn_row["matched"] == 0:
+            raise ValueError(
+                f"{cli_args.false_negative_filename!r} is not a pure false-negative example with correct hits: "
+                f"FP={fn_row['fp_count']}, FN={fn_row['fn_count']}, matched={fn_row['matched']}, F1={fn_row['f1']:.4f}"
+            )
     else:
-        fn_candidates = [row for row in rows if row["fn_count"] > 0]
+        fn_candidates = [
+            row
+            for row in rows
+            if row["fn_count"] > 0 and row["fp_count"] == 0 and row["matched"] > 0 and row["f1"] > 0
+        ]
         if not fn_candidates:
-            raise ValueError("No false-negative example was found in this split.")
-        fn_row = sorted(fn_candidates, key=lambda row: (row["fn_count"], row["f1"]), reverse=True)[0]
+            raise ValueError(
+                "No pure false-negative example was found in this split "
+                "(need FN>0, FP=0, matched>0). You can pass --false-negative-filename explicitly."
+            )
+        fn_row = sorted(
+            fn_candidates,
+            key=lambda row: (row["fn_count"], row["matched"], row["f1"]),
+            reverse=True,
+        )[0]
 
     if fp_row["filename"] == fn_row["filename"]:
         times = unmatched_pred_times(fp_row)[:1] + unmatched_true_times(fn_row)[:1]
@@ -342,8 +374,8 @@ def choose_error_panels(rows: Sequence[Dict[str, object]], cli_args: argparse.Na
     fp_center = unmatched_pred_times(fp_row)[0] if unmatched_pred_times(fp_row) else None
     fn_center = unmatched_true_times(fn_row)[0] if unmatched_true_times(fn_row) else None
     return [
-        ("False-positive example", fp_row, fp_center),
-        ("False-negative example", fn_row, fn_center),
+        ("Pure false-positive example", fp_row, fp_center),
+        ("Pure false-negative example", fn_row, fn_center),
     ]
 
 
