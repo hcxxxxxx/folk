@@ -399,12 +399,32 @@ def display_mel(mel: np.ndarray) -> np.ndarray:
     return np.clip((mel - low) / (high - low), 0.0, 1.0)
 
 
+def matched_event_times(row: Dict[str, object]) -> List[float]:
+    times: List[float] = []
+    for pair in row["matched_pairs"]:
+        if not pair["matched"]:
+            continue
+        times.append(float(pair["pred_time"]))
+        if pair["true_time"] is not None:
+            times.append(float(pair["true_time"]))
+    return times
+
+
 def crop_interval(row: Dict[str, object], center_time: Optional[float], window_sec: float) -> Tuple[float, float]:
     duration = float(row["duration_sec"])
     if center_time is None or window_sec <= 0:
         return 0.0, duration
-    width = min(float(window_sec), duration)
-    start = max(0.0, float(center_time) - width / 2.0)
+
+    focus_times = [float(center_time)]
+    support_times = matched_event_times(row)
+    if support_times:
+        focus_times.append(min(support_times, key=lambda value: abs(value - float(center_time))))
+
+    margin = max(5.0, float(window_sec) * 0.15)
+    required_width = max(focus_times) - min(focus_times) + 2.0 * margin
+    width = min(max(float(window_sec), required_width), duration)
+    center = (min(focus_times) + max(focus_times)) / 2.0
+    start = max(0.0, center - width / 2.0)
     end = min(duration, start + width)
     start = max(0.0, end - width)
     return start, end
@@ -421,32 +441,6 @@ def draw_boundaries(ax, row: Dict[str, object], start_sec: float, end_sec: float
     matched_true = matched_true_indices(row)
     matched_pred_indices = {int(pair["pred_index"]) for pair in row["matched_pairs"] if pair["matched"]}
 
-    for index, time in enumerate(row["true_times_sec"]):
-        if not (start_sec <= float(time) <= end_sec):
-            continue
-        if index in matched_true:
-            line_once(
-                ax,
-                used_labels,
-                float(time),
-                label="Ground truth",
-                color="#53d7ff",
-                linestyle="--",
-                linewidth=1.4,
-                alpha=0.95,
-            )
-        else:
-            line_once(
-                ax,
-                used_labels,
-                float(time),
-                label="False negative",
-                color="#ffd23f",
-                linestyle="--",
-                linewidth=2.2,
-                alpha=0.98,
-            )
-
     for pred_index, time in enumerate(row["pred_times_sec"]):
         if not (start_sec <= float(time) <= end_sec):
             continue
@@ -458,8 +452,9 @@ def draw_boundaries(ax, row: Dict[str, object], start_sec: float, end_sec: float
                 label="Matched prediction",
                 color="#37e66f",
                 linestyle="-",
-                linewidth=1.5,
-                alpha=0.9,
+                linewidth=1.7,
+                alpha=0.72,
+                zorder=4,
             )
         else:
             line_once(
@@ -471,6 +466,34 @@ def draw_boundaries(ax, row: Dict[str, object], start_sec: float, end_sec: float
                 linestyle="-",
                 linewidth=2.2,
                 alpha=0.98,
+                zorder=5,
+            )
+
+    for index, time in enumerate(row["true_times_sec"]):
+        if not (start_sec <= float(time) <= end_sec):
+            continue
+        line_once(
+            ax,
+            used_labels,
+            float(time),
+            label="Ground truth",
+            color="#53d7ff",
+            linestyle="--",
+            linewidth=1.6,
+            alpha=0.98,
+            zorder=6,
+        )
+        if index not in matched_true:
+            line_once(
+                ax,
+                used_labels,
+                float(time),
+                label="False negative",
+                color="#ffd23f",
+                linestyle=(0, (1.2, 1.2)),
+                linewidth=2.4,
+                alpha=0.82,
+                zorder=7,
             )
 
 
